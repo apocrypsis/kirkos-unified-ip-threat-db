@@ -1,7 +1,9 @@
 import os
 import re
 import sys
+import time
 import json
+import ijson
 import zipfile
 import requests
 import tempfile
@@ -16,11 +18,8 @@ OXL_IP_LIST_REPO_URL = "https://github.com/O-X-L/risk-db-lists/archive/refs/head
 SHARED_TEMP_DIR_OBJ = tempfile.TemporaryDirectory()
 SHARED_TEMP_PATH = os.path.abspath(SHARED_TEMP_DIR_OBJ.name)
 
-# Use pytricia for fast lookups of CIDR blocks.
-trie = pytricia.PyTricia()
-
 def _error_and_exit(err_msg: str):
-    print(err_msg)
+    print(f"::error::{err_msg}") 
     sys.exit(1)
 
 def _download_and_extract(url: str, subfolder_name: str, max_size_mb: int = 100):
@@ -33,23 +32,24 @@ def _download_and_extract(url: str, subfolder_name: str, max_size_mb: int = 100)
         _error_and_exit(f"Error creating temporary directory {target_dir}: {str(dir_err)}")
         
     try:
-        resp = requests.get(url, timeout=30, stream=True)
+        # Stream the data, rather than downloading all at once.
+        with requests.get(url, timeout=30, stream=True) as resp:
+            if not resp.status_code == 200:
+                _error_and_exit(f"HTTP 200 not received for {url}")
+
+            # Create a temporary file for the download.
+            # Specify delete=False so it doesn't get deleted on close.
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
+                zip_tmp_path = temp_file.name
+
+            # Write the file to temporary storage in chunks.
+            with open(zip_tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk: # filter out keep-alive chunks
+                        f.write(chunk)
+
     except Exception as dl_err:
         _error_and_exit(f"Error downloading file from {url}: {str(dl_err)}")
-
-    if not resp.status_code == 200:
-        _error_and_exit(f"HTTP 200 not received for {url}")
-
-    # Create a temporary file for the download.
-    # Specify delete=False so it doesn't get deleted on close.
-    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
-        zip_tmp_path = temp_file.name
-
-    # Write the file to temporary storage.
-    with open(zip_tmp_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                f.write(chunk)
 
     # Extraction code based on 
     # https://medium.com/@01one/complete-guide-how-to-zip-and-unzip-files-with-python-c0107700b392
@@ -94,31 +94,60 @@ def download_and_parse_oxl_ip_json():
     json_path = os.path.join(oxl_json_location, "asn_ipv4_full.json")
     if not os.path.exists(json_path):
         _error_and_exit(f"JSON file does not exist at {json_path}")
-    
+
     print(f"Parsing OXL JSON")
-    raw_json = {}
+    # Cache common ASN/orgs.
+    string_cache = {}
+    payload_cache = {}
+
+    # Use pytricia for fast lookups of CIDR blocks.
+    trie = pytricia.PyTricia()
+
     try:
-        with open(json_path) as f:
-            raw_json = json.load(f)
+        with open(json_path, "rb") as infile:
+            # Get items from root.
+            kv_pairs = ijson.kvitems(infile, "")
+
+            for asn, asn_obj in kv_pairs:
+                if not isinstance(asn_obj, dict):
+                    continue
+
+                ipv4 = asn_obj.get("ipv4", [])
+                raw_asn = asn
+                raw_org = asn_obj.get("info", {}).get("name", "").lower() or asn_obj.get("organization", {}).get("name", "").lower()
+                
+                # Cache individual strings to reuse them.
+                if raw_asn not in string_cache:
+                    string_cache[raw_asn] = sys.intern(str(raw_asn))
+                if raw_org not in string_cache:
+                    string_cache[raw_org] = sys.intern(str(raw_org))
+                
+                cached_asn = string_cache[raw_asn]
+                cached_org = string_cache[raw_org]
+                
+                # Cache the payload combination.
+                combo_key = (cached_asn, cached_org)
+                if combo_key not in payload_cache:
+                    payload_cache[combo_key] = {
+                        "asn": cached_asn,
+                        "org": cached_org
+                    }
+
+                if not isinstance(ipv4, list):
+                    if isinstance(ipv4, str):
+                        ipv4 = [ipv4]
+                    else:
+                        print("WARN: ipv4 field does not hold string or list value for ASN {asn}.")
+                        continue
+                
+                for ip_address in ipv4:
+                    trie[ip_address] = payload_cache[combo_key]
+
+        return (json_path, trie)
+
     except Exception as json_err:
         _error_and_exit(f"Error loading JSON {json_path}")
     
-    for asn in raw_json:
-        ipv4 = raw_json[asn].get("ipv4", [])
-        org = raw_json[asn].get("organization", {})
-        org_name = org.get("name", "").lower()
-    
-        if not isinstance(ipv4, list):
-            if isinstance(ipv4, str):
-                ipv4 = [ipv4]
-            else:
-                _error_and_exit("ipv4 field does not hold string or list value.")
-
-        for ip_address in ipv4:
-            trie[ip_address] = {
-                "asn": asn,
-                "org": org_name
-            }
 
 def download_and_parse_oxl_risk_lists():
     risk_ips = {}
@@ -142,7 +171,7 @@ def download_and_parse_oxl_risk_lists():
     # Extract and assign the type to every IP within the file.
     # Note that we run the risk of missing some classifications if 
     # a single IP is classified as multiple types.
-    ips = {}
+    ips = set()
     for type_file in type_files:
         type_filename = os.path.basename(type_file)
         kind = type_filename.replace("kind_", "").replace(".txt", "")
@@ -174,7 +203,7 @@ def download_and_parse_oxl_risk_lists():
         risk_ips[reported_ip]["reported"] = True
     return risk_ips
 
-def enrich_risk_lists(parsed_risk_lists: dict):
+def enrich_risk_lists(parsed_risk_lists: dict, trie):
     print(f"Enriching risk lists")
     for ip in parsed_risk_lists:
         if ip in trie:
@@ -182,28 +211,55 @@ def enrich_risk_lists(parsed_risk_lists: dict):
             parsed_risk_lists[ip]["asn"] = org_info_object["asn"]
             parsed_risk_lists[ip]["org"] = org_info_object["org"]
 
-def generate_mmdb(parsed_risk_lists):
+def generate_mmdb(json_path, parsed_risk_lists, trie):
     print(f"Generating MMDB")
+
     writer = MMDBWriter()
     
-    # First insert the larger CIDR blocks from Pytricia.
-    for cidr_string in trie.keys():
-        payload = trie[cidr_string]
-        writer.insert_network(IPSet([cidr_string]), payload)
-    
-    # Insert the /32 addresses from the JSON.
-    for ip_32_string, payload in parsed_risk_lists.items():
-        writer.insert_network(IPSet([ip_32_string]), payload)
+    # First insert all the IPv4 blocks from the Pytricia object.
+    try:
+        for cidr_string in trie.keys():
+            writer.insert_network(IPSet([cidr_string]), trie[cidr_string])
 
-    print(f"Writing MMDB to file")
-    writer.to_db_file("ip_intel.mmdb")
+    except Exception as writer_err:
+        _error_and_exit(f"Error writing CIDR blocks to mmdb: {str(writer_err)}")           
+    
+    try:
+        # Insert the /32 addresses from the risk lists.
+        for ip_32_string, payload in parsed_risk_lists.items():
+            writer.insert_network(IPSet([ip_32_string]), payload)
+    except Exception as risk_writer_err:
+        _error_and_exit(f"Error writing risk data to mmdb: {str(risk_writer_err)}")  
+
+    print(f"Writing to MMDB")
+
+    # Free up some memory before writing to file.
+    parsed_risk_lists.clear()
+    trie = None
+
+    try:
+        writer.to_db_file("ip_intel.mmdb")
+    except Exception as write_err:
+        print(f"Error writing to MMDB: {str(write_err)}")
     
 def main():
     try:
-        download_and_parse_oxl_ip_json()
+        start_time = time.perf_counter()
+
+        (oxl_json_path, trie) = download_and_parse_oxl_ip_json()
         parsed_risk_lists = download_and_parse_oxl_risk_lists()
-        enrich_risk_lists(parsed_risk_lists)
-        generate_mmdb(parsed_risk_lists)
+        enrich_risk_lists(parsed_risk_lists, trie)
+
+        elapsed_time = time.perf_counter() - start_time
+        print(f"Elapsed time prior to MMDB generation: {elapsed_time:.2f} seconds")
+        generate_mmdb(oxl_json_path, parsed_risk_lists, trie)
+
+        end_time = time.perf_counter()
+        total_elapsed_time = end_time - start_time
+        print(f"Total execution time: {total_elapsed_time:.2f} seconds")
+
+    except Exception as err:
+        _error_and_exit(f"Error during execution: {str(err)}")
     finally:
         SHARED_TEMP_DIR_OBJ.cleanup()
 
